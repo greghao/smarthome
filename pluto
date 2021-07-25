@@ -1,0 +1,662 @@
+version: "3.7"
+
+########################### NETWORKS
+# docker network create --gateway 192.168.90.1 --subnet 192.168.90.0/24 t2_proxy
+networks:
+  t2_proxy:
+    external:
+      name: t2_proxy
+  default:
+    driver: bridge
+
+########################### SERVICES
+services:
+# All services / apps go below this line
+
+############################# FRONTENDS
+
+# Traefik 2 - Reverse Proxy
+  traefik:
+    container_name: traefik2
+    image: traefik:chevrotin # the chevrotin tag refers to v2.2.x
+    restart: unless-stopped
+    command: # CLI arguments
+      - --global.checkNewVersion=true
+      - --global.sendAnonymousUsage=true
+      - --entryPoints.http.address=:80
+      - --entryPoints.https.address=:443
+        # Allow these IPs to set the X-Forwarded-* headers - Cloudflare IPs: https://www.cloudflare.com/ips/
+      - --entrypoints.https.forwardedHeaders.trustedIPs=173.245.48.0/20,103.21.244.0/22,103.22.200.0/22,103.31.4.0/22,141.101.64.0/18,108.162.192.0/18,190.93.240.0/20,188.114.96.0/20,197.234.240.0/22,198.41.128.0/17,162.158.0.0/15,104.16.0.0/13,104.24.0.0/14,172.64.0.0/13,131.0.72.0/22
+      - --entryPoints.traefik.address=:8080
+      - --api=true
+#      - --api.insecure=true
+#      - --serversTransport.insecureSkipVerify=true
+      - --log=true
+      - --log.level=DEBUG # (Default: error) DEBUG, INFO, WARN, ERROR, FATAL, PANIC
+      - --accessLog=true
+      - --accessLog.filePath=/traefik.log
+      - --accessLog.bufferingSize=100 # Configuring a buffer of 100 lines
+      - --accessLog.filters.statusCodes=400-499
+      - --providers.docker=true
+      - --providers.docker.endpoint=unix:///var/run/docker.sock
+      - --providers.docker.defaultrule=Host(`{{ index .Labels "com.docker.compose.service" }}.$DOMAINNAME`)
+      - --providers.docker.exposedByDefault=false
+      - --providers.docker.network=t2_proxy
+      - --providers.docker.swarmMode=false
+      - --providers.file.directory=/rules # Load dynamic configuration from one or more .toml or .yml files in a directory.
+#      - --providers.file.filename=/path/to/file # Load dynamic configuration from a file.
+      - --providers.file.watch=true # Only works on top level files in the rules folder
+#      - --certificatesResolvers.dns-cloudflare.acme.caServer=https://acme-staging-v02.api.letsencrypt.org/directory # LetsEncrypt Staging Server - uncomment when testing
+      - --certificatesResolvers.dns-cloudflare.acme.email=$CLOUDFLARE_EMAIL
+      - --certificatesResolvers.dns-cloudflare.acme.storage=/acme.json
+      - --certificatesResolvers.dns-cloudflare.acme.dnsChallenge.provider=cloudflare
+    networks:
+      t2_proxy:
+        ipv4_address: 192.168.90.254 # You can specify a static IP
+#    networks:
+#      - t2_proxy
+    security_opt:
+      - no-new-privileges:true
+    ports:
+      - target: 80
+        published: 80
+        protocol: tcp
+        mode: host
+      - target: 443
+        published: 443
+        protocol: tcp
+        mode: host
+      - target: 8080
+        published: 8080
+        protocol: tcp
+        mode: host
+    volumes:
+      - $USERDIR/docker/traefik2/rules:/rules 
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - $USERDIR/docker/traefik2/acme/acme.json:/acme.json 
+      - $USERDIR/docker/traefik2/traefik.log:/traefik.log 
+      - $USERDIR/docker/shared:/shared
+    environment:
+      - CF_API_EMAIL=$CLOUDFLARE_EMAIL
+      - CF_API_KEY=$CLOUDFLARE_API_KEY
+    labels:
+      - "traefik.enable=true"
+      # HTTP-to-HTTPS Redirect
+      - "traefik.http.routers.http-catchall.entrypoints=http"
+      - "traefik.http.routers.http-catchall.rule=HostRegexp(`{host:.+}`)"
+      - "traefik.http.routers.http-catchall.middlewares=redirect-to-https"
+      - "traefik.http.middlewares.redirect-to-https.redirectscheme.scheme=https"
+      # HTTP Routers
+      - "traefik.http.routers.traefik-rtr.entrypoints=https"
+      - "traefik.http.routers.traefik-rtr.rule=Host(`traefik.$DOMAINNAME`)"
+      - "traefik.http.routers.traefik-rtr.tls=true"
+#      - "traefik.http.routers.traefik-rtr.tls.certresolver=dns-cloudflare" # Comment out this line after first run of traefik to force the use of wildcard certs
+      - "traefik.http.routers.traefik-rtr.tls.domains[0].main=$DOMAINNAME"
+      - "traefik.http.routers.traefik-rtr.tls.domains[0].sans=*.$DOMAINNAME"
+#      - "traefik.http.routers.traefik-rtr.tls.domains[1].main=$SECONDDOMAINNAME" # Pulls main cert for second domain
+#      - "traefik.http.routers.traefik-rtr.tls.domains[1].sans=*.$SECONDDOMAINNAME" # Pulls wildcard cert for second domain
+      ## Services - API
+      - "traefik.http.routers.traefik-rtr.service=api@internal"
+      ## Middlewares
+#      - "traefik.http.routers.traefik-rtr.middlewares=middlewares-basic-auth@file" 
+      - "traefik.http.routers.traefik-rtr.middlewares=chain-oauth@file"
+
+# Google OAuth - Single Sign On using OAuth 2.0
+  oauth:
+    container_name: oauth
+    image: thomseddon/traefik-forward-auth:latest
+    restart: unless-stopped
+    networks:
+      - t2_proxy
+    security_opt:
+      - no-new-privileges:true
+    environment:
+      - CLIENT_ID=$GOOGLE_CLIENT_ID
+      - CLIENT_SECRET=$GOOGLE_CLIENT_SECRET
+      - SECRET=$OAUTH_SECRET
+      - COOKIE_DOMAIN=$DOMAINNAME
+      - INSECURE_COOKIE=false
+      - AUTH_HOST=oauth.$DOMAINNAME
+      - URL_PATH=/_oauth
+      - WHITELIST=$MY_EMAIL,$MY_EMAIL2
+      - LOG_LEVEL=info
+      - LOG_FORMAT=text
+      - LIFETIME=2592000 # 30 days
+    labels:
+      - "traefik.enable=true"
+      ## HTTP Routers
+      - "traefik.http.routers.oauth-rtr.entrypoints=https"
+      - "traefik.http.routers.oauth-rtr.rule=Host(`oauth.$DOMAINNAME`)"
+      - "traefik.http.routers.oauth-rtr.tls=true"
+      ## HTTP Services
+      - "traefik.http.routers.oauth-rtr.service=oauth-svc"
+      - "traefik.http.services.oauth-svc.loadbalancer.server.port=4181"
+      ## Middlewares
+      - "traefik.http.routers.oauth-rtr.middlewares=chain-oauth@file"
+
+# Portainer - WebUI for Containers
+  portainer:
+    container_name: portainer
+    image: portainer/portainer-ce:latest
+    restart: unless-stopped
+    command: -H unix:///var/run/docker.sock
+    networks:
+      - t2_proxy
+    security_opt:
+      - no-new-privileges:true
+#    ports:
+#      - "$PORTAINER_PORT:9000"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - $USERDIR/docker/portainer/data:/data 
+    environment:
+      - TZ=$TZ
+    labels:
+      - "traefik.enable=true"
+      ## HTTP Routers
+      - "traefik.http.routers.portainer-rtr.entrypoints=https"
+      - "traefik.http.routers.portainer-rtr.rule=Host(`portainer.$DOMAINNAME`)"
+      - "traefik.http.routers.portainer-rtr.tls=true"
+      ## Middlewares
+#      - "traefik.http.routers.portainer-rtr.middlewares=chain-no-auth@file" # No Authentication
+#      - "traefik.http.routers.portainer-rtr.middlewares=chain-basic-auth@file" # Basic Authentication
+      - "traefik.http.routers.portainer-rtr.middlewares=chain-oauth@file" # Google OAuth 2.0
+      ## HTTP Services
+      - "traefik.http.routers.portainer-rtr.service=portainer-svc"
+      - "traefik.http.services.portainer-svc.loadbalancer.server.port=9000"
+
+# Autoindex - Simple Directory Index ## alternative to lighttpd
+  autoindex:
+    container_name: autoindex
+    image: dceoy/nginx-autoindex:latest
+    restart: always
+    networks:
+      - t2_proxy
+    security_opt:
+      - no-new-privileges:true
+#    ports:
+#      - "$AUTOINDEX_PORT:80"
+    volumes:
+      - /$USERDIR/MyBook/Anime:/var/lib/nginx/html:ro # Location you want to index
+    labels:
+      - "traefik.enable=true"
+      ## HTTP Routers
+      - "traefik.http.routers.autoindex-rtr.entrypoints=https"
+      - "traefik.http.routers.autoindex-rtr.rule=Host(`index.$DOMAINNAME`)"
+      - "traefik.http.routers.autoindex-rtr.tls=true"
+#      - "traefik.http.routers.autoindex-rtr.tls.certresolver=dns-cloudflare" 
+      ## Middlewares
+      - "traefik.http.routers.autoindex-rtr.middlewares=chain-no-auth@file" # No Authentication
+#      - "traefik.http.routers.autoindex-rtr.middlewares=chain-oauth@file"
+      ## HTTP Services
+      - "traefik.http.routers.autoindex-rtr.service=autoindex-svc"
+      - "traefik.http.services.autoindex-svc.loadbalancer.server.port=80"
+
+# Docker-DOH - DNS over HTTPS
+  doh-server:
+    image: satishweb/doh-server
+    container_name: doh
+    restart: always
+    networks:
+      - t2_proxy
+    labels:
+      - "traefik.enable=true"
+      ## HTTP Routers
+      - "traefik.http.routers.doh-rtr.entrypoints=https"
+      - "traefik.http.routers.doh-rtr.rule=Host(`doh.$DOMAINNAME`)"
+      - "traefik.http.routers.doh-rtr.tls=true"
+      ## Middlewares
+      - "traefik.http.routers.doh-rtr.middlewares=chain-no-auth@file" # No Authentication
+      ## HTTP Services
+      - "traefik.http.routers.doh-rtr.service=doh-svc"
+      - "traefik.http.services.doh-svc.loadbalancer.server.port=8053"
+    environment:
+      DEBUG: "0"
+      # Upstream DNS server: proto:host:port
+      # We are using OpenDNS DNS servers as default,
+      # Here is the list of addresses: https://use.opendns.com/
+      UPSTREAM_DNS_SERVER: "udp:192.168.90.253:53"
+      DOH_HTTP_PREFIX: "/dns-query"
+      DOH_SERVER_LISTEN: ":8053"
+      DOH_SERVER_TIMEOUT: "10"
+      DOH_SERVER_TRIES: "3"
+      DOH_SERVER_VERBOSE: "true"
+      # You can add more variables here or as docker secret and entrypoint
+      # script will replace them inside doh-server.conf file
+#    volumes:
+      # - ${USERDIR}/docker/doh-server/doh-server.conf:/server/doh-server.conf
+      # Mount app-config script with your customizations
+      # - ./app-config:/app-config
+
+# Miniflux - RSS reader
+  miniflux:
+    image: miniflux/miniflux:latest
+    container_name: miniflux-web
+    restart: always
+    ports:
+      - "8585:8080"
+    dns:
+      - 192.168.90.253
+      - 192.168.90.252
+    environment:
+      - DATABASE_URL=postgres://miniflux:secret@db/miniflux?sslmode=disable
+      - RUN_MIGRATIONS=1
+    networks:
+      - t2_proxy
+    labels:
+      - "traefik.enable=true"
+      ## HTTP Routers
+      - "traefik.http.routers.miniflux-rtr.entrypoints=https"
+      - "traefik.http.routers.miniflux-rtr.rule=Host(`miniflux.$DOMAINNAME`)"
+      - "traefik.http.routers.miniflux-rtr.tls=true"
+      ## Middlewares
+      - "traefik.http.routers.miniflux-rtr.middlewares=chain-no-auth@file" # No Authentication
+#      - "traefik.http.routers.miniflux-rtr.middlewares=chain-basic-auth@file" # Basic Authentication
+#      - "traefik.http.routers.miniflux-rtr.middlewares=chain-oauth@file" # Google OAuth 2.0
+      ## HTTP Services
+      - "traefik.http.routers.miniflux-rtr.service=miniflux-svc"
+      - "traefik.http.services.miniflux-svc.loadbalancer.server.port=8080"
+
+
+############################# DATABASE
+
+# PostgreSQL - database for miniflux
+  db:
+    image: postgres:latest
+    container_name: miniflux-db
+    restart: always
+    networks:
+      - t2_proxy
+    volumes:
+        - ${USERDIR}/docker/miniflux_db:/var/lib/postgresql/data
+    environment:
+      - PUID=$PUID
+      - PGID=$PGID
+      - POSTGRES_USER=miniflux
+      - POSTGRES_PASSWORD=secret
+
+#volumes:
+#  miniflux-db:
+
+## MariaDB - MySQL Database
+#  mariadb:
+#    container_name: mariadb
+#    image: linuxserver/mariadb:latest
+#    restart: always
+#    networks:
+#      t2_proxy:
+#        ipv4_address: 192.168.90.250 
+#    security_opt:
+#      - no-new-privileges:true
+#    ports:
+#      - "3306:3306"
+#    volumes:
+#      - $USERDIR/docker/mariadb/data:/config
+#      - /etc/timezone:/etc/timezone:ro
+#      - /etc/localtime:/etc/localtime:ro
+#    environment:
+#      - PUID=$PUID
+#      - PGID=$PGID
+#      - MYSQL_ROOT_PASSWORD=$MYSQL_ROOT_PASSWORD
+
+############################# UTILITIES
+
+# ddclient - Dynamic DNS Uupdater
+  ddclient:
+    image: linuxserver/ddclient
+    container_name: ddclient
+    restart: always
+    networks:
+      - t2_proxy
+    volumes:
+      - ${USERDIR}/docker/ddclient/config:/config
+    dns:
+      - 1.1.1.1
+      - 192.168.253
+    environment:
+      - PUID=${PUID}
+      - PGID=${PGID}
+      - TZ=${TZ}
+      - DNS1=192.168.90.253
+      - DNS2=1.1.1.1
+
+## Unbound - DNS Server
+  unbound:
+    container_name: unbound
+    image: mvance/unbound:latest
+    restart: always
+    networks:
+      t2_proxy:
+        ipv4_address: 192.168.90.252
+#    ports:
+#      - '5353:5353'
+    volumes:
+      - $USERDIR/docker/pihole/unbound:/opt/unbound/etc/unbound
+
+## Pihole - Ad-blocker
+  pihole:
+    container_name: pihole
+    image: pihole/pihole:latest
+    restart: always
+    depends_on:
+      - unbound
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+      - NET_BIND_SERVICE
+    networks:
+      t2_proxy:
+        ipv4_address: 192.168.90.253
+    ports:
+      - '53:53/tcp'
+      - '53:53/udp'
+#      - '67:67/udp'
+      - '8081:80/tcp'
+      - '8082:443/tcp'
+    dns:
+      - 127.0.0.1
+      - 192.168.90.252 # Unbound IP
+    volumes:
+      - $USERDIR/docker/pihole/pihole:/etc/pihole
+#      ## Add dark skin to pihole: https://github.com/thomasbnt/Night_PiHole
+#      - $USERDIR/docker/pihole/theme/skin-blue.min.css:/var/www/html/admin/style/vendor/skin-blue.min.css
+#      - $USERDIR/docker/pihole/theme/AdminLTE.min.css:/var/www/html/admin/style/vendor/AdminLTE.min.css
+      - $USERDIR/docker/pihole/resolv.conf/resolv.conf:/etc/resolv.conf:ro
+      - $USERDIR/docker/pihole/pihole/hosts:/etc/hosts:ro
+      - $USERDIR/docker/pihole/dnsmasq.d:/etc/dnsmasq.d
+      ## Run `touch ~/docker/pihole/pihole.log` before starting pihole
+#      - $USERDIR/docker/pihole/pihole.log:/var/log/pihole.log
+#      - ${USERDIR}/docker/pihole/scripts/whitelist/scripts/whitelist.sh:/usr/local/bin/whitelist.sh
+    environment:
+      - TZ=$TZ
+      - ServerIP=192.168.97.31 # (My Docker Host IP)
+      - IPv6=False
+      - WEBPASSWORD=$PIHOLE_PASSWORD
+      - DNS1=127.0.0.1
+      - DNS2=192.168.90.252 # Unbound IP
+    labels:
+      - "traefik.enable=true"
+      ## HTTP Routers
+      - "traefik.http.routers.pihole-rtr.entrypoints=https"
+      - "traefik.http.routers.pihole-rtr.rule=Host(`pihole.$DOMAINNAME`)"
+      - "traefik.http.routers.pihole-rtr.tls=true"
+      - "traefik.http.routers.pihole-rtr.tls.certresolver=dns-cloudflare"
+      ## Middlewares
+#      - "traefik.http.routers.pihole-rtr.middlewares=chain-no-auth@file" # No Authentication
+#      - "traefik.http.routers.pihole-rtr.middlewares=chain-basic-auth@file" # Basic Authentication
+      - "traefik.http.routers.pihole-rtr.middlewares=chain-oauth@file,add-admin" # Google OAuth 2.0
+      - "traefik.http.middlewares.add-admin.addPrefix.prefix=/admin"
+      ## HTTP Services
+      - "traefik.http.routers.pihole-rtr.service=pihole-svc"
+      - "traefik.http.services.pihole-svc.loadbalancer.server.port=80"
+
+# Glances - System Information
+  glances:
+    image: nicolargo/glances:latest
+    container_name: glances
+    restart: unless-stopped
+    privileged: true
+#    network_mode: host
+    networks:
+      - t2_proxy
+    security_opt:
+      - no-new-privileges:true
+#    ports:
+#      - "$GLANCES_PORT:61208"
+    pid: host
+    volumes:
+#      - $USERDIR/docker/glances/glances.conf:/glances/conf/glances.conf # Use this if you want to add a glances.conf file
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    environment:
+#      GLANCES_OPT: "-C /glances/conf/glances.conf --quiet --export influxdb"
+      GLANCES_OPT: "-w"
+    labels:
+      - "traefik.enable=true"
+      ## HTTP Routers
+      - "traefik.http.routers.glances-rtr.entrypoints=https"
+      - "traefik.http.routers.glances-rtr.rule=Host(`glances.$DOMAINNAME`)"
+      - "traefik.http.routers.glances-rtr.tls=true"
+#      - "traefik.http.routers.glances-rtr.tls.certresolver=dns-cloudflare" 
+      ## Middlewares
+      - "traefik.http.routers.glances-rtr.middlewares=chain-oauth@file"
+      ## HTTP Services
+      - "traefik.http.routers.glances-rtr.service=glances-svc"
+      - "traefik.http.services.glances-svc.loadbalancer.server.port=61208"
+
+############################# DOWNLOADERS
+
+# SABnzbd - Binary newsgrabber (NZB downloader)
+  sabnzbd:
+    image: "linuxserver/sabnzbd"
+    container_name: "sabnzbd"
+    volumes:
+      - ${USERDIR}/docker/sabnzbd:/config
+      - ${USERDIR}/MyBook/tmp/_complete:/downloads
+      - ${USERDIR}/MyBook/tmp/_incomplete:/incomplete-downloads
+      - ${USERDIR}/docker/shared:/shared
+    ports:
+        - "9999:8080"
+    dns:
+      - 192.168.90.253
+      - 1.1.1.1
+    restart: always
+    environment:
+      - PUID=${PUID}
+      - PGID=${PGID}
+      - TZ=${TZ}
+    networks:
+      - t2_proxy
+    labels:
+      - "traefik.enable=true"
+      ## HTTP Routers
+      - "traefik.http.routers.sabnzbd-rtr.entrypoints=https"
+      - "traefik.http.routers.sabnzbd-rtr.rule=Host(`sabnzbd.$DOMAINNAME`)"
+      - "traefik.http.routers.sabnzbd-rtr.tls=true"
+      ## Middlewares
+      - "traefik.http.routers.sabnzbd-rtr.middlewares=chain-no-auth@file" # No Authentication
+#      - "traefik.http.routers.sabnzbd-rtr.middlewares=chain-basic-auth@file" # Basic Authentication
+#      - "traefik.http.routers.sabnzbd-rtr.middlewares=chain-oauth@file" # Google OAuth 2.0
+      ## HTTP Services
+      - "traefik.http.routers.sabnzbd-rtr.service=sabnzbd-svc"
+      - "traefik.http.services.sabnzbd-svc.loadbalancer.server.port=8080"
+
+# Transmission-OpenVPN
+  transmission-vpn:
+    container_name: transmission-vpn
+    image: haugene/transmission-openvpn
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun
+    restart: always
+#    ports:
+#    - "9091:9091"
+    dns:
+      - 192.168.90.253
+      - 1.1.1.1
+    volumes:
+      - /etc/localtime:/etc/localtime:ro
+      - ${USERDIR}/docker/transmission-vpn:/data
+      - ${USERDIR}/docker/shared:/shared
+      - ${USERDIR}/MyBook/tmp/:/data/watch
+      - ${USERDIR}/MyBook/tmp/_complete:/data/completed
+      - ${USERDIR}/MyBook/tmp/_incomplete:/data/incomplete
+    environment:
+      - OPENVPN_PROVIDER=SURFSHARK
+      - OPENVPN_USERNAME=$SURFSHARK_USERNAME
+      - OPENVPN_PASSWORD=$SURFSHARK_PASSWORD
+      - OPENVPN_CONFIG=jp-tok_udp
+      - OPENVPN_OPTS=--inactive 3600 --ping 10 --ping-exit 60
+      - LOCAL_NETWORK=192.168.97.0/24
+      - PUID=${PUID}
+      - PGID=${PGID}
+      - TZ=${TZ}
+      - TRANSMISSION_WEB_UI=kettu #kettu/flood
+      - TRANSMISSION_RPC_AUTHENTICATION_REQUIRED=true
+      - TRANSMISSION_RPC_HOST_WHITELIST="127.0.0.1,192.168.*.*,192.168.90.2,192.168.90.11"
+      - TRANSMISSION_RPC_PASSWORD=123
+      - TRANSMISSION_RPC_USERNAME=greg
+#      - TRANSMISSION_UMASK=002
+      - TRANSMISSION_RATIO_LIMIT=0.5
+      - TRANSMISSION_RATIO_LIMIT_ENABLED=true
+    networks:
+      - t2_proxy
+    labels:
+      - "traefik.enable=true"
+      ## HTTP Routers
+      - "traefik.http.routers.transmission-vpn-rtr.entrypoints=https"
+      - "traefik.http.routers.transmission-vpn-rtr.rule=Host(`trans.$DOMAINNAME`)"
+      - "traefik.http.routers.transmission-vpn-rtr.tls=true"
+      ## Middlewares
+      - "traefik.http.routers.transmission-vpn-rtr.middlewares=middlewares-rate-limit@file"
+      ## HTTP Services
+      - "traefik.http.routers.transmission-vpn-rtr.service=transmission-vpn-svc"
+      - "traefik.http.services.transmission-vpn-svc.loadbalancer.server.port=9091"
+
+# Radarr - Movie management
+  radarr:
+    image: "linuxserver/radarr"
+    container_name: "radarr"
+    volumes:
+      - ${USERDIR}/docker/radarr:/config
+      - ${USERDIR}/MyBook/tmp:/downloads
+      - ${USERDIR}/MyBook/tmp/_complete:/data/completed
+      - ${USERDIR}/MyBook/tmp/_incomplete:/data/incomplete
+      - ${USERDIR}//MyBook/Movies:/movies
+      - "/etc/localtime:/etc/localtime:ro"
+      - ${USERDIR}/docker/shared:/shared
+#    ports:
+#      - "7878:7878"
+    dns:
+      - 192.168.90.253
+      - 1.1.1.1
+    restart: always
+    environment:
+      - PUID=${PUID}
+      - PGID=${PGID}
+      - TZ=${TZ}
+    networks:
+      - t2_proxy
+    labels:
+      - "traefik.enable=true"
+      ## HTTP Routers
+      - "traefik.http.routers.radarr-rtr.entrypoints=https"
+      - "traefik.http.routers.radarr-rtr.rule=Host(`radarr.$DOMAINNAME`)"
+#      - "traefik.http.routers.radarr-rtr.rule=Host(`radarr.$DOMAINNAME`) && (Headers(`X-Api-Key`, `$RADARR_API_KEY`) || Query(`apikey`, `$RADARR_API_KEY`))"
+#      - "traefik.http.routers.radarr-rtr-bypass.priority=100"
+      - "traefik.http.routers.radarr-rtr.tls=true"
+#      - "traefik.http.routers.radarr-rtr.tls.certresolver=dns-cloudflare" 
+      ## Middlewares
+      - "traefik.http.routers.radarr-rtr.middlewares=middlewares-rate-limit@file"
+#      - "traefik.http.routers.radarr-rtr-bypass.middlewares=chain-no-auth@file"
+#      - "traefik.http.routers.radarr-rtr.middlewares=chain-oauth@file"
+      ## HTTP Services
+      - "traefik.http.routers.radarr-rtr.service=radarr-svc"
+#      - "traefik.http.routers.radarr-rtr-bypass.service=radarr-svc"
+      - "traefik.http.services.radarr-svc.loadbalancer.server.port=7878"
+
+# Sonarr - TV Shows management
+  sonarr:
+    image: linuxserver/sonarr
+    container_name: sonarr
+    volumes:
+      - ${USERDIR}/docker/sonarr:/config
+      - ${USERDIR}/MyBook/tmp/_complete:/downloads
+      - ${USERDIR}/MyBook/tmp/_complete:/data/completed
+      - ${USERDIR}/MyBook/tmp/_incomplete:/data/incomplete
+#      - $(USERDIR)/MyBook/Anime:/anime
+      - /home/greg/MyBook/Anime:/anime
+      - ${USERDIR}/MyBook/TV:/tv
+      - "/etc/localtime:/etc/localtime:ro"
+      - ${USERDIR}/docker/shared:/shared
+    ports:
+        - "8989:8989"
+    dns:
+      - 192.168.90.253
+      - 1.1.1.1
+    restart: always
+    environment:
+      - PUID=${PUID}
+      - PGID=${PGID}
+      - TZ=${TZ}
+    networks:
+      - t2_proxy
+    labels:
+      - "traefik.enable=true"
+      ## HTTP Routers
+      - "traefik.http.routers.sonarr-rtr.entrypoints=https"
+      - "traefik.http.routers.sonarr-rtr.rule=Host(`sonarr.$DOMAINNAME`)"
+#      - "traefik.http.routers.sonarr-rtr.rule=Host(`sonarr.$DOMAINNAME`) && (Headers(`X-Api-Key`, `$SONARR_API_KEY`) || Query(`apikey`, `$SONARR_API_KEY`))"
+      - "traefik.http.routers.sonarr-rtr.tls=true"
+#      - "traefik.http.routers.sonarr-rtr.tls.certresolver=dns-cloudflare" 
+      ## Middlewares
+      - "traefik.http.routers.sonarr-rtr.middlewares=middlewares-rate-limit@file"
+#      - "traefik.http.routers.sonarr-rtr-bypass.middlewares=chain-no-auth@file"
+#      - "traefik.http.routers.sonarr-rtr.middlewares=chain-oauth@file"
+      ## HTTP Services
+      - "traefik.http.routers.sonarr-rtr.service=sonarr-svc"
+#      - "traefik.http.routers.sonarr-rtr-bypass.service=sonarr-svc"
+      - "traefik.http.services.sonarr-svc.loadbalancer.server.port=8989"
+
+############################# MEDIA
+
+# Tautulli - Plex statistics and monitoring
+  tautulli:
+    container_name: tautulli
+    restart: always
+    image: linuxserver/tautulli
+    volumes:
+      - ${USERDIR}/docker/tautulli/config:/config
+#      - ${USERDIR}/docker/tautulli/logs:/logs:ro
+      - /var/lib/plexmediaserver/Library/Application Support/Plex\ Media\ Server/Logs:/logs:ro
+      - ${USERDIR}/docker/shared:/shared
+#    ports:
+#      - "XXXX:8181"
+    environment:
+      - PUID=${PUID}
+      - PGID=${PGID}
+      - TZ=${TZ}
+    networks:
+      - t2_proxy
+    labels:
+      - "traefik.enable=true"
+      ## HTTP Routers
+      - "traefik.http.routers.tautulli-rtr.entrypoints=https"
+      - "traefik.http.routers.tautulli-rtr.rule=Host(`tautulli.$DOMAINNAME`)"
+      - "traefik.http.routers.tautulli-rtr.tls=true"
+      ## Middlewares
+      - "traefik.http.routers.tautulli-rtr.middlewares=chain-no-auth@file" # No Authentication
+#      - "traefik.http.routers.tautulli-rtr.middlewares=chain-basic-auth@file" # Basic Authentication
+#      - "traefik.http.routers.tautulli-rtr.middlewares=chain-oauth@file" # Google OAuth 2.0
+      ## HTTP Services
+      - "traefik.http.routers.tautulli-rtr.service=tautulli-svc"
+      - "traefik.http.services.tautulli-svc.loadbalancer.server.port=8181"
+
+# Overseerr - Plex content request
+  overseerr:
+    image: sctx/overseerr:latest
+    container_name: overseerr
+    environment:
+      - LOG_LEVEL=info
+      - TZ=${TZ}
+#    ports:
+#      - 5055:5055
+    volumes:
+      - ${USERDIR}/docker/overseerr/config:/app/config
+    restart: unless-stopped
+    networks:
+      - t2_proxy
+    labels:
+      - "traefik.enable=true"
+      ## HTTP Routers
+      - "traefik.http.routers.overseerr-rtr.entrypoints=https"
+      - "traefik.http.routers.overseerr-rtr.rule=Host(`overseerr.$DOMAINNAME`)"
+      - "traefik.http.routers.overseerr-rtr.tls=true"
+      ## Middlewares
+      - "traefik.http.routers.overseerr-rtr.middlewares=chain-no-auth@file" # No Authentication
+#      - "traefik.http.routers.overseerr-rtr.middlewares=chain-basic-auth@file" # Basic Authentication
+#      - "traefik.http.routers.overseerr-rtr.middlewares=chain-oauth@file" # Google OAuth 2.0
+      ## HTTP Services
+      - "traefik.http.routers.overseerr-rtr.service=overseerr-svc"
+      - "traefik.http.services.overseerr-svc.loadbalancer.server.port=5055"
+
